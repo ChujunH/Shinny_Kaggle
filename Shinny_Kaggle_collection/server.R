@@ -5,19 +5,30 @@ library(stringr)
 library(DT)
 library(ggplot2)
 library(tools)
+library(httr)
+library(jsonlite)
 
-# ====== Kaggle CLI path (yours) ======
-KAGGLE_BIN <- "/opt/anaconda3/bin/kaggle"
+# ====== Kaggle API credentials ======
+get_kaggle_auth <- function() {
+  username <- Sys.getenv("KAGGLE_USERNAME")
+  key <- Sys.getenv("KAGGLE_KEY")
+  
+  if (username == "" || key == "") {
+    stop("KAGGLE_USERNAME and KAGGLE_KEY must be set as environment variables")
+  }
+  
+  list(username = username, key = key)
+}
 
-# Helper: default fallback for NULL/NA/""
+# Helper
 `%||%` <- function(a, b) {
   if (is.null(a) || length(a) == 0 || is.na(a) || a == "") b else a
 }
 
-# Columns in your metadata CSV (you provided names(A))
+# Column names
 COL_TABULAR <- "tabular_files"
 COL_URL     <- "url"
-COL_ID      <- "dataset_id"   # usually owner/dataset
+COL_ID      <- "dataset_id"
 COL_TITLE   <- "title"
 COL_CREATOR <- "creator"
 COL_UPDATED <- "last_updated"
@@ -26,61 +37,66 @@ COL_CITE    <- "citation"
 COL_NOTE    <- "note"
 
 extract_kaggle_ref <- function(dataset_id, url) {
-  # Prefer dataset_id if it already looks like owner/dsname
   if (!is.null(dataset_id) && !is.na(dataset_id) && nzchar(dataset_id) && str_detect(dataset_id, "/")) {
     return(dataset_id)
   }
-  # Else parse from URL
   m <- str_match(url, "kaggle\\.com/datasets/([^/?#]+/[^/?#]+)")[, 2]
   ifelse(is.na(m), NA_character_, m)
 }
 
+# ====== Kaggle API functions ======
 kaggle_list_files <- function(ref) {
-  if (!file.exists(KAGGLE_BIN)) {
-    stop(paste0("Kaggle CLI not found at: ", KAGGLE_BIN,
-                "\nPlease update KAGGLE_BIN in server.R to your `which kaggle` path."))
+  auth <- get_kaggle_auth()
+  
+  url <- paste0("https://www.kaggle.com/api/v1/datasets/list/", ref, "/files")
+  
+  response <- tryCatch({
+    GET(
+      url,
+      authenticate(auth$username, auth$key, type = "basic"),
+      timeout(30)
+    )
+  }, error = function(e) {
+    stop(paste0("Failed to connect to Kaggle API: ", conditionMessage(e)))
+  })
+  
+  if (status_code(response) != 200) {
+    stop(paste0(
+      "Kaggle API error (", status_code(response), "): ",
+      content(response, "text", encoding = "UTF-8")
+    ))
   }
   
-  out <- tryCatch(
-    system2(KAGGLE_BIN, c("datasets", "files", "-d", ref), stdout = TRUE, stderr = TRUE),
-    error = function(e) {
-      stop(paste0("Failed to run Kaggle CLI from R.\n", conditionMessage(e)))
-    }
-  )
+  result <- content(response, "parsed")
   
-  # Find header line
-  lines <- out[str_detect(out, "\\S")]
-  hdr_i <- which(str_detect(lines, "^name\\s+size\\s+creationDate"))
-  if (length(hdr_i) == 0) {
-    stop(paste("Failed to parse file list.\nOutput:\n", paste(out, collapse = "\n")))
+  if (length(result$datasetFiles) == 0) {
+    return(data.frame(
+      name = character(0),
+      size = character(0),
+      creationDate = character(0),
+      stringsAsFactors = FALSE
+    ))
   }
   
-  # Parse rows after header + separator
-  data_lines <- lines[(hdr_i + 2):length(lines)]
-  data_lines <- data_lines[!str_detect(data_lines, "^[-]+$")]
-  data_lines <- data_lines[str_detect(data_lines, "\\S")]
-  
-  parsed <- lapply(data_lines, function(x) {
-    parts <- str_split(x, "\\s{2,}", simplify = TRUE)
-    parts <- parts[parts != ""]
-    if (length(parts) < 3) return(NULL)
+  files_list <- lapply(result$datasetFiles, function(f) {
     data.frame(
-      name = parts[1],
-      size = parts[2],
-      creationDate = parts[3],
+      name = f$name %||% NA_character_,
+      size = format(structure(f$totalBytes %||% 0, class = "object_size"), units = "auto"),
+      creationDate = f$creationDate %||% NA_character_,
       stringsAsFactors = FALSE
     )
   })
   
-  df <- bind_rows(parsed)
+  df <- bind_rows(files_list)
   
-  # Only tabular files
   df %>%
     filter(str_detect(tolower(name), "\\.(csv|tsv)$")) %>%
     arrange(name)
 }
 
 kaggle_download_to_temp <- function(ref, file_in_dataset, cache_dir) {
+  auth <- get_kaggle_auth()
+  
   dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
   
   safe_ref <- gsub("[^A-Za-z0-9._-]+", "_", ref)
@@ -88,26 +104,50 @@ kaggle_download_to_temp <- function(ref, file_in_dataset, cache_dir) {
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
   
   target_path <- file.path(out_dir, basename(file_in_dataset))
+  
   if (file.exists(target_path)) return(target_path)
   
-  args <- c("datasets", "download", "-d", ref, "-f", file_in_dataset, "--path", out_dir, "--unzip")
-  status <- tryCatch(
-    system2(KAGGLE_BIN, args, stdout = TRUE, stderr = TRUE),
-    error = function(e) {
-      stop(paste0("Kaggle download failed.\n", conditionMessage(e)))
-    }
+  ref_parts <- str_split(ref, "/", simplify = TRUE)
+  if (ncol(ref_parts) != 2) {
+    stop(paste0("Invalid dataset reference: ", ref))
+  }
+  
+  owner <- ref_parts[1]
+  dataset <- ref_parts[2]
+  
+  url <- paste0(
+    "https://www.kaggle.com/api/v1/datasets/download/",
+    owner, "/", dataset, "/", file_in_dataset
   )
   
-  if (!file.exists(target_path)) {
+  response <- tryCatch({
+    GET(
+      url,
+      authenticate(auth$username, auth$key, type = "basic"),
+      write_disk(target_path, overwrite = TRUE),
+      progress(),
+      timeout(300)
+    )
+  }, error = function(e) {
+    stop(paste0("Download failed: ", conditionMessage(e)))
+  })
+  
+  if (status_code(response) != 200) {
+    if (file.exists(target_path)) file.remove(target_path)
     stop(paste0(
-      "Kaggle download failed.\nCommand: ", KAGGLE_BIN, " ", paste(args, collapse = " "),
-      "\n\nOutput:\n", paste(status, collapse = "\n")
+      "Kaggle download failed (", status_code(response), "): ",
+      content(response, "text", encoding = "UTF-8")
     ))
+  }
+  
+  if (!file.exists(target_path)) {
+    stop("Download completed but file not found")
   }
   
   target_path
 }
 
+# ====== Shiny Server ======
 shinyServer(function(input, output, session) {
   
   cache_dir <- reactiveVal(file.path(tempdir(), "kaggle_shiny_cache"))
@@ -116,33 +156,76 @@ shinyServer(function(input, output, session) {
     p <- cache_dir()
     if (dir.exists(p)) unlink(p, recursive = TRUE, force = TRUE)
     dir.create(p, showWarnings = FALSE, recursive = TRUE)
+    showNotification("Cache cleared", type = "message")
   }, ignoreInit = TRUE)
   
+  # Load metadata
   meta <- eventReactive(input$load_meta, {
-    validate(need(file.exists(input$meta_path), "Metadata CSV not found."))
-    readr::read_csv(input$meta_path, show_col_types = FALSE)
-  }, ignoreInit = FALSE)
+    req(input$meta_path)
+    
+    if (!file.exists(input$meta_path)) {
+      showNotification(
+        paste0("File not found: ", input$meta_path),
+        type = "error",
+        duration = 10
+      )
+      return(data.frame())
+    }
+    
+    tryCatch({
+      readr::read_csv(input$meta_path, show_col_types = FALSE)
+    }, error = function(e) {
+      showNotification(
+        paste0("Error reading CSV: ", conditionMessage(e)),
+        type = "error",
+        duration = 10
+      )
+      return(data.frame())
+    })
+  })
   
+  # Filter metadata
   meta_filtered <- reactive({
     df <- meta()
-    validate(
-      need(COL_TABULAR %in% names(df), paste0("Missing column: ", COL_TABULAR)),
-      need(COL_URL %in% names(df), paste0("Missing column: ", COL_URL)),
-      need(COL_ID %in% names(df), paste0("Missing column: ", COL_ID))
-    )
+    
+    if (is.null(df) || nrow(df) == 0) {
+      return(data.frame())
+    }
+    
+    # Check required columns
+    missing_cols <- c()
+    if (!(COL_TABULAR %in% names(df))) missing_cols <- c(missing_cols, COL_TABULAR)
+    if (!(COL_URL %in% names(df))) missing_cols <- c(missing_cols, COL_URL)
+    if (!(COL_ID %in% names(df))) missing_cols <- c(missing_cols, COL_ID)
+    
+    if (length(missing_cols) > 0) {
+      showNotification(
+        paste0("Missing columns: ", paste(missing_cols, collapse = ", ")),
+        type = "error",
+        duration = 10
+      )
+      return(data.frame())
+    }
     
     df %>%
       mutate(kaggle_ref = mapply(extract_kaggle_ref, .data[[COL_ID]], .data[[COL_URL]])) %>%
       filter(.data[[COL_TABULAR]] == 1, !is.na(kaggle_ref))
   })
   
+  # Display metadata table
   output$meta_tbl <- renderDT({
-    DT::datatable(meta_filtered(), options = list(pageLength = 10), rownames = FALSE)
+    df <- meta_filtered()
+    req(nrow(df) > 0)
+    DT::datatable(df, options = list(pageLength = 10), rownames = FALSE)
   })
   
+  # Dataset selector
   output$dataset_ui <- renderUI({
     df <- meta_filtered()
-    validate(need(nrow(df) > 0, "No rows after filtering tabular_files == 1."))
+    
+    if (is.null(df) || nrow(df) == 0) {
+      return(helpText("No datasets available. Click 'Load metadata' first."))
+    }
     
     title_vec <- df[[COL_TITLE]]
     idx <- is.na(title_vec) | title_vec == ""
@@ -154,38 +237,65 @@ shinyServer(function(input, output, session) {
     selectInput("ref_pick", "Select Kaggle dataset", choices = choices)
   })
   
-  
-  # List files for selected dataset (CSV/TSV)
+  # List files in dataset
   files_df <- reactive({
     req(input$ref_pick)
-    kaggle_list_files(input$ref_pick)
+    
+    tryCatch({
+      kaggle_list_files(input$ref_pick)
+    }, error = function(e) {
+      showNotification(
+        paste0("Error listing files: ", conditionMessage(e)),
+        type = "error",
+        duration = 10
+      )
+      return(data.frame())
+    })
   })
   
+  # File selector
   output$file_ui <- renderUI({
     fd <- files_df()
-    validate(need(nrow(fd) > 0, "No CSV/TSV files found in this dataset (or listing failed)."))
-    selectInput("file_pick", "Select file inside dataset (-f)", choices = fd$name)
+    
+    if (is.null(fd) || nrow(fd) == 0) {
+      return(helpText("No CSV/TSV files found in this dataset"))
+    }
+    
+    selectInput("file_pick", "Select file inside dataset", choices = fd$name)
   })
   
+  # Selected metadata row
   selected_meta <- reactive({
     df <- meta_filtered()
-    req(input$ref_pick)
+    req(input$ref_pick, nrow(df) > 0)
     df %>% filter(kaggle_ref == input$ref_pick) %>% slice(1)
   })
   
-  # Local path of selected file (download to temp cache)
+  # Download and get local path
   local_path <- reactive({
     req(input$ref_pick, input$file_pick)
-    kaggle_download_to_temp(
-      ref = input$ref_pick,
-      file_in_dataset = input$file_pick,
-      cache_dir = cache_dir()
-    )
+    
+    tryCatch({
+      kaggle_download_to_temp(
+        ref = input$ref_pick,
+        file_in_dataset = input$file_pick,
+        cache_dir = cache_dir()
+      )
+    }, error = function(e) {
+      showNotification(
+        paste0("Download error: ", conditionMessage(e)),
+        type = "error",
+        duration = 10
+      )
+      return(NULL)
+    })
   })
   
-  # Read CSV
+  # Read data
   dat <- reactive({
     p <- local_path()
+    req(!is.null(p), file.exists(p))
+    
     readr::read_csv(
       p,
       guess_max = 10000,
@@ -194,60 +304,44 @@ shinyServer(function(input, output, session) {
     )
   })
   
-  # Small dataset stats card for Description tab
-  data_card <- reactive({
-    df <- dat()
-    
-    miss <- sapply(df, function(x) mean(is.na(x)))
-    if (length(miss) == 0) {
-      top_col <- NA_character_
-      top_rate <- NA_real_
-    } else {
-      top_col <- names(which.max(miss))
-      top_rate <- as.numeric(max(miss))
-    }
-    
-    list(
-      n_rows = nrow(df),
-      n_cols = ncol(df),
-      top_missing_col = top_col,
-      top_missing_rate = top_rate
-    )
-  })
-  
-  # Description tab output (from metadata CSV + card from dat())
+  # Description output
   output$desc_out <- renderUI({
     row <- selected_meta()
     req(nrow(row) == 1)
     
-    desc <- row$description[[1]]
-    cite <- row$citation[[1]]
+    desc <- if (COL_DESC %in% names(row)) row[[COL_DESC]][1] else NA
+    cite <- if (COL_CITE %in% names(row)) row[[COL_CITE]][1] else NA
     
     tagList(
       tags$h4("Description"),
-      tags$pre(style = "white-space: pre-wrap;", ifelse(is.na(desc) || desc == "", "(empty)", desc)),
+      tags$pre(
+        style = "white-space: pre-wrap;", 
+        ifelse(is.na(desc) || desc == "", "(empty)", desc)
+      ),
       tags$hr(),
       tags$h4("Citation"),
-      tags$pre(style = "white-space: pre-wrap;", ifelse(is.na(cite) || cite == "", "(empty)", cite))
+      tags$pre(
+        style = "white-space: pre-wrap;", 
+        ifelse(is.na(cite) || cite == "", "(empty)", cite)
+      )
     )
   })
   
-  
-  
-  
-  # Download selected CSV
+  # Download handler
   output$download_selected <- downloadHandler(
     filename = function() {
       req(input$ref_pick, input$file_pick)
       paste0(gsub("/", "__", input$ref_pick), "__", basename(input$file_pick))
     },
     content = function(file) {
-      file.copy(local_path(), file, overwrite = TRUE)
+      p <- local_path()
+      req(!is.null(p), file.exists(p))
+      file.copy(p, file, overwrite = TRUE)
     },
     contentType = "text/csv"
   )
   
-  # Types & Missing tab
+  # Types & Missing
   output$type_out <- renderPrint({
     df <- dat()
     
@@ -264,13 +358,18 @@ shinyServer(function(input, output, session) {
     print(head(sort(miss, decreasing = TRUE), 20))
   })
   
-  
+  # Summary
   output$summary_out <- renderPrint({
     summary(dat())
   })
   
+  # Head UI
   output$head_ui <- renderUI({
-    if (isTRUE(input$use_dt)) DTOutput("head_dt") else tableOutput("head_tbl")
+    if (isTRUE(input$use_dt)) {
+      DTOutput("head_dt")
+    } else {
+      tableOutput("head_tbl")
+    }
   })
   
   output$head_dt <- renderDT({
@@ -287,11 +386,13 @@ shinyServer(function(input, output, session) {
     head(dat(), input$head_n)
   })
   
+  # Variable selector for plot
   output$var_ui <- renderUI({
     df <- dat()
     selectInput("plot_var", "Variable", choices = names(df))
   })
   
+  # Plot
   output$plot_out <- renderPlot({
     df <- dat()
     req(input$plot_var)
@@ -299,21 +400,21 @@ shinyServer(function(input, output, session) {
     x <- df[[input$plot_var]]
     if (isTRUE(input$drop_na_plot)) x <- x[!is.na(x)]
     
-    # numeric: histogram
     if (is.numeric(x)) {
       dd <- data.frame(x = x)
       ggplot(dd, aes(x = x)) +
         geom_histogram(bins = 30) +
-        labs(x = input$plot_var, y = "Count")
+        labs(x = input$plot_var, y = "Count") +
+        theme_minimal()
     } else {
-      # categorical: bar / pie
       dd <- data.frame(x = as.factor(x))
       
       if (input$chart_type == "bar") {
         ggplot(dd, aes(x = x)) +
           geom_bar() +
           coord_flip() +
-          labs(x = input$plot_var, y = "Count")
+          labs(x = input$plot_var, y = "Count") +
+          theme_minimal()
       } else {
         pdat <- as.data.frame(table(dd$x))
         colnames(pdat) <- c("x", "n")
@@ -327,16 +428,20 @@ shinyServer(function(input, output, session) {
     }
   })
   
-  
+  # Debug
   output$debug_out <- renderPrint({
     list(
-      kaggle_bin = KAGGLE_BIN,
+      kaggle_username = Sys.getenv("KAGGLE_USERNAME"),
+      kaggle_key_set = nchar(Sys.getenv("KAGGLE_KEY")) > 0,
       meta_path = input$meta_path,
+      meta_loaded = !is.null(meta()) && nrow(meta()) > 0,
       cache_dir = cache_dir(),
       picked_ref = input$ref_pick,
       picked_file = input$file_pick,
-      local_path = tryCatch(local_path(), error = function(e) paste("local_path() error:", conditionMessage(e)))
+      local_path = tryCatch(
+        local_path(), 
+        error = function(e) paste("Error:", conditionMessage(e))
+      )
     )
   })
-  
 })
