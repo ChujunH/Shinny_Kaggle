@@ -119,15 +119,14 @@ ensure_sitecustomize <- function() {
 kaggle_auth_handle <- function() {
   user <- Sys.getenv("KAGGLE_USERNAME")
   key  <- Sys.getenv("KAGGLE_KEY")
-  if (!nzchar(user) || !nzchar(key)) {
-    stop("Kaggle credentials not found. Please set KAGGLE_USERNAME and KAGGLE_KEY (Connect Cloud secret variables).")
-  }
+  if (!nzchar(user) || !nzchar(key)) return(NULL)
+  
   h <- curl::new_handle()
   curl::handle_setopt(
     h,
     userpwd   = paste0(user, ":", key),
-    httpauth  = 1L,                 # CURLAUTH_BASIC
-    useragent = "shiny-connect"     # 强制给一个非空 UA
+    httpauth  = 1L,
+    useragent = "shiny-connect"
   )
   h
 }
@@ -183,7 +182,56 @@ extract_kaggle_ref <- function(dataset_id, url) {
   ifelse(is.na(m), NA_character_, m)
 }
 
+# ---------- Kaggle CLI runner (for local fallback) ----------
+run_kaggle_cli <- function(args) {
+  # ensure config/UA if env vars exist
+  ensure_kaggle_auth()
+  
+  if (!nzchar(KAGGLE_BIN)) {
+    stop("kaggle CLI not found. Set KAGGLE_BIN or install kaggle.")
+  }
+  
+  out <- system2(KAGGLE_BIN, args, stdout = TRUE, stderr = TRUE)
+  status <- attr(out, "status") %||% 0
+  if (status != 0) {
+    stop("Kaggle CLI failed.\n", paste(out, collapse = "\n"))
+  }
+  out
+}
+
+# ---------- CLI version: list files ----------
+kaggle_list_files_cli <- function(ref) {
+  out <- run_kaggle_cli(c("datasets", "files", "--csv", ref))
+  
+  lines <- out[str_detect(out, "\\S")]
+  txt <- paste(lines, collapse = "\n")
+  
+  df <- tryCatch(
+    readr::read_csv(I(txt), show_col_types = FALSE),
+    error = function(e) {
+      stop("Failed to parse Kaggle CLI --csv output.\n\nOutput:\n", paste(out, collapse = "\n"))
+    }
+  )
+  
+  names(df) <- tolower(names(df))
+  if (!("name" %in% names(df))) {
+    stop("Kaggle CLI output missing 'name' column.\n\nOutput:\n", paste(out, collapse = "\n"))
+  }
+  
+  df %>%
+    mutate(name = as.character(.data$name)) %>%
+    filter(str_detect(tolower(name), "\\.(csv|tsv)$")) %>%
+    arrange(name)
+}
+
+
 kaggle_list_files <- function(ref) {
+  h <- kaggle_auth_handle()
+  if (is.null(h)) {
+    # 没 key：走你原来的 CLI 版本（本地）
+    return(kaggle_list_files_cli(ref))   # 你把旧版函数改名留着
+  }
+  # 有 key：走 API 版本（Connect）
   parts <- strsplit(ref, "/", fixed = TRUE)[[1]]
   if (length(parts) != 2) stop("Invalid Kaggle ref (expected owner/dataset): ", ref)
   
@@ -227,37 +275,53 @@ kaggle_download_to_temp <- function(ref, file_in_dataset, cache_dir) {
   target_path <- file.path(out_dir, basename(file_in_dataset))
   if (file.exists(target_path)) return(target_path)
   
+  h <- kaggle_auth_handle()
+  
+  if (is.null(h)) {
+    # ---- local fallback: use CLI download ----
+    ensure_kaggle_auth()
+    args <- c("datasets", "download", "-d", ref, "-f", file_in_dataset, "--path", out_dir, "--unzip")
+    out <- system2(KAGGLE_BIN, args, stdout = TRUE, stderr = TRUE)
+    status <- attr(out, "status") %||% 0
+    if (status != 0) {
+      stop("Kaggle CLI download failed.\nArgs: ", paste(args, collapse = " "),
+           "\n\nOutput:\n", paste(out, collapse = "\n"))
+    }
+    
+    # file should appear after unzip
+    cand <- list.files(out_dir, recursive = TRUE, full.names = TRUE)
+    hit <- cand[basename(cand) == basename(file_in_dataset)]
+    if (length(hit) == 0) stop("Downloaded but cannot find file: ", file_in_dataset)
+    file.copy(hit[1], target_path, overwrite = TRUE)
+    return(target_path)
+  }
+  
+  # ---- Connect (or local with keys): use API download ----
   parts <- strsplit(ref, "/", fixed = TRUE)[[1]]
   owner <- curl::curl_escape(parts[1])
   ds    <- curl::curl_escape(parts[2])
   fn    <- curl::curl_escape(file_in_dataset)
   
-  tmp_zip <- file.path(out_dir, "download.tmp")
+  tmp_bin <- file.path(out_dir, "download.tmp")
+  kaggle_api_download(sprintf("/datasets/download/%s/%s/%s", owner, ds, fn), tmp_bin)
   
-  # GET /datasets/download/:ownerSlug/:datasetSlug/:fileName
-  kaggle_api_download(sprintf("/datasets/download/%s/%s/%s", owner, ds, fn), tmp_zip)
-  
-  # 判断是不是 zip（zip 文件头 "PK"）
-  sig <- readBin(tmp_zip, what = "raw", n = 2)
+  sig <- readBin(tmp_bin, what = "raw", n = 2)
   is_zip <- length(sig) == 2 && identical(sig, as.raw(c(0x50, 0x4B)))
   
   if (is_zip) {
-    utils::unzip(tmp_zip, exdir = out_dir)
-    unlink(tmp_zip)
-    
+    utils::unzip(tmp_bin, exdir = out_dir)
+    unlink(tmp_bin)
     cand <- list.files(out_dir, recursive = TRUE, full.names = TRUE)
     hit <- cand[basename(cand) == basename(file_in_dataset)]
-    if (length(hit) == 0) {
-      stop("Downloaded zip but cannot find file inside: ", file_in_dataset)
-    }
+    if (length(hit) == 0) stop("Downloaded zip but cannot find file inside: ", file_in_dataset)
     file.copy(hit[1], target_path, overwrite = TRUE)
     return(target_path)
   } else {
-    # 不是 zip，就当作文件本体
-    file.rename(tmp_zip, target_path)
+    file.rename(tmp_bin, target_path)
     return(target_path)
   }
 }
+
 
 
 
