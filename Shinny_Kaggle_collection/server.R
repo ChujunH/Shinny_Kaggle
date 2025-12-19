@@ -6,10 +6,38 @@ library(DT)
 library(ggplot2)
 library(tools)
 
-Sys.setenv(KAGGLE_BIN = "/opt/anaconda3/bin/kaggle")
+if (file.exists("/opt/anaconda3/bin/kaggle")) {
+  Sys.setenv(KAGGLE_BIN = "/opt/anaconda3/bin/kaggle")
+}
+
 
 # ====== Kaggle CLI path (yours) ======
+# ====== Kaggle runner (local + cloud compatible) ======
+# local: use CLI if available; cloud: fallback to python -m kaggle
 KAGGLE_BIN <- Sys.getenv("KAGGLE_BIN", unset = Sys.which("kaggle"))
+
+PY_BIN <- Sys.which("python3")
+if (!nzchar(PY_BIN)) PY_BIN <- Sys.which("python")
+
+has_kaggle_creds <- function() {
+  user <- Sys.getenv("KAGGLE_USERNAME")
+  key  <- Sys.getenv("KAGGLE_KEY")
+  json <- file.path(path.expand("~"), ".kaggle", "kaggle.json")
+  (nzchar(user) && nzchar(key)) || file.exists(json)
+}
+
+run_kaggle <- function(args) {
+  if (!has_kaggle_creds()) {
+    stop("Kaggle credentials not found. Set KAGGLE_USERNAME and KAGGLE_KEY on Connect Cloud (secret variables).")
+  }
+  if (nzchar(KAGGLE_BIN)) {
+    return(system2(KAGGLE_BIN, args, stdout = TRUE, stderr = TRUE))
+  }
+  if (nzchar(PY_BIN)) {
+    return(system2(PY_BIN, c("-m", "kaggle", args), stdout = TRUE, stderr = TRUE))
+  }
+  stop("Neither kaggle CLI nor python found.")
+}
 
 # Helper: default fallback for NULL/NA/""
 `%||%` <- function(a, b) {
