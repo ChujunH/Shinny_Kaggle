@@ -50,6 +50,37 @@ ensure_kaggle_auth <- function() {
   }
 }
 
+#helper
+ensure_sitecustomize <- function() {
+  d <- file.path(tempdir(), "py_sitecustomize")
+  dir.create(d, showWarnings = FALSE, recursive = TRUE)
+  f <- file.path(d, "sitecustomize.py")
+  
+  if (!file.exists(f)) {
+    writeLines(
+      c(
+        "import os",
+        "try:",
+        "    import requests",
+        "    from requests.sessions import Session",
+        "    _old = Session.request",
+        "    def _patched(self, method, url, **kwargs):",
+        "        headers = kwargs.get('headers') or {}",
+        "        ua = headers.get('User-Agent')",
+        "        if ua is None:",
+        "            headers['User-Agent'] = os.environ.get('HTTP_USER_AGENT') or 'shiny-connect'",
+        "            kwargs['headers'] = headers",
+        "        return _old(self, method, url, **kwargs)",
+        "    Session.request = _patched",
+        "except Exception:",
+        "    pass"
+      ),
+      f
+    )
+  }
+  d
+}
+
 
 run_kaggle <- function(args) {
   
@@ -69,12 +100,16 @@ run_kaggle <- function(args) {
     stop("Kaggle credentials not found. Set KAGGLE_USERNAME and KAGGLE_KEY on Connect Cloud (secret variables).")
   }
   
-  # 显式传给 kaggle 子进程，避免 User-Agent 变 None
+  # requests User-Agent=None 的 Connect Cloud bug → monkey patch
+  site_dir <- ensure_sitecustomize()
+  
   UA <- "shiny-connect"
   extra_env <- c(
-    paste0("KAGGLE_USER_AGENT=", UA),
     paste0("HTTP_USER_AGENT=", UA),
-    paste0("KAGGLE_HTTP_USER_AGENT=", UA)
+    paste0("KAGGLE_USER_AGENT=", UA),
+    paste0("KAGGLE_HTTP_USER_AGENT=", UA),
+    #  python 自动 import sitecustomize.py
+    paste0("PYTHONPATH=", site_dir)
   )
   
   if (nzchar(KAGGLE_BIN)) {
@@ -93,6 +128,7 @@ run_kaggle <- function(args) {
   
   stop("Neither kaggle CLI nor python found.")
 }
+
 
 
 
