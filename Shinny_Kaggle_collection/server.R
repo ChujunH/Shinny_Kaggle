@@ -46,9 +46,18 @@ extract_kaggle_ref <- function(dataset_id, url) {
 
 # ====== Kaggle API functions ======
 kaggle_list_files <- function(ref) {
-  auth <- get_kaggle_auth()
+  auth <- tryCatch({
+    get_kaggle_auth()
+  }, error = function(e) {
+    stop(paste0("❌ Authentication failed: ", conditionMessage(e), 
+                "\nKAGGLE_USERNAME is set: ", nchar(Sys.getenv("KAGGLE_USERNAME")) > 0,
+                "\nKAGGLE_KEY is set: ", nchar(Sys.getenv("KAGGLE_KEY")) > 0))
+  })
   
   url <- paste0("https://www.kaggle.com/api/v1/datasets/list/", ref, "/files")
+  
+  cat("🔍 Attempting to fetch:", url, "\n")
+  cat("👤 Username:", auth$username, "\n")
   
   response <- tryCatch({
     GET(
@@ -57,13 +66,17 @@ kaggle_list_files <- function(ref) {
       timeout(30)
     )
   }, error = function(e) {
-    stop(paste0("Failed to connect to Kaggle API: ", conditionMessage(e)))
+    stop(paste0("❌ Network error: ", conditionMessage(e)))
   })
   
+  cat("📡 Response status:", status_code(response), "\n")
+  
   if (status_code(response) != 200) {
+    error_content <- content(response, "text", encoding = "UTF-8")
+    cat("❌ Error response:", error_content, "\n")
     stop(paste0(
       "Kaggle API error (", status_code(response), "): ",
-      content(response, "text", encoding = "UTF-8")
+      error_content
     ))
   }
   
