@@ -5,6 +5,9 @@ library(stringr)
 library(DT)
 library(ggplot2)
 library(tools)
+library(jsonlite)
+library(curl)
+
 
 if (file.exists("/opt/anaconda3/bin/kaggle")) {
   Sys.setenv(KAGGLE_BIN = "/opt/anaconda3/bin/kaggle")
@@ -113,62 +116,38 @@ ensure_sitecustomize <- function() {
 }
 
 
-run_kaggle <- function(args) {
-  
-  # ensure kaggle.json from secrets (works on Connect Cloud)
+kaggle_auth_handle <- function() {
   user <- Sys.getenv("KAGGLE_USERNAME")
   key  <- Sys.getenv("KAGGLE_KEY")
-  if (nzchar(user) && nzchar(key)) {
-    cfg <- file.path(tempdir(), "kaggle_cfg")
-    dir.create(cfg, showWarnings = FALSE, recursive = TRUE)
-    writeLines(sprintf('{"username":"%s","key":"%s"}', user, key),
-               file.path(cfg, "kaggle.json"))
-    Sys.chmod(file.path(cfg, "kaggle.json"), "600")
-    Sys.setenv(KAGGLE_CONFIG_DIR = cfg)
+  if (!nzchar(user) || !nzchar(key)) {
+    stop("Kaggle credentials not found. Please set KAGGLE_USERNAME and KAGGLE_KEY (Connect Cloud secret variables).")
   }
-  
-  UA <- "shiny-connect"
-  extra_env <- c(
-    paste0("HTTP_USER_AGENT=", UA),
-    paste0("KAGGLE_USER_AGENT=", UA),
-    paste0("KAGGLE_HTTP_USER_AGENT=", UA)
+  h <- curl::new_handle()
+  curl::handle_setopt(
+    h,
+    userpwd   = paste0(user, ":", key),
+    httpauth  = 1L,                 # CURLAUTH_BASIC
+    useragent = "shiny-connect"     # 强制给一个非空 UA
   )
-  
-  # 1) Try kaggle CLI first (best for local)
-  if (nzchar(KAGGLE_BIN)) {
-    out <- system2(KAGGLE_BIN, args, stdout = TRUE, stderr = TRUE, env = extra_env)
-    status <- attr(out, "status") %||% 0
-    
-    if (status == 0) return(out)
-    
-    msg <- paste(out, collapse = "\n")
-    
-    # If it's the known Connect Cloud UA=None bug, then fallback to python API
-    if (grepl("Header part \\(None\\).*User-Agent", msg, perl = TRUE) ||
-        grepl("User-Agent', None", msg, fixed = TRUE)) {
-      
-      if (!has_python_kaggle()) {
-        stop(
-          "Kaggle CLI hit User-Agent=None bug, and Python doesn't have 'kaggle' installed.\n",
-          "Fix options:\n",
-          "  (1) Install kaggle into PY_BIN:  ", PY_BIN, " -m pip install kaggle\n",
-          "  (2) Or set PY_BIN to the python env that already has kaggle.\n\n",
-          msg
-        )
-      }
-      
-      # fallback: python -m kaggle
-      out2 <- system2(PY_BIN, c("-m", "kaggle", args), stdout = TRUE, stderr = TRUE, env = extra_env)
-      status2 <- attr(out2, "status") %||% 0
-      if (status2 != 0) stop("python -m kaggle failed.\n", paste(out2, collapse = "\n"))
-      return(out2)
-    }
-    
-    # Other CLI failure: just show it
-    stop("Kaggle CLI failed.\n", msg)
+  h
+}
+
+kaggle_api_get <- function(path) {
+  h <- kaggle_auth_handle()
+  url <- paste0("https://www.kaggle.com/api/v1", path)
+  res <- curl::curl_fetch_memory(url, handle = h)
+  txt <- rawToChar(res$content)
+  if (res$status_code >= 400) {
+    stop(sprintf("Kaggle API error %s\nURL: %s\nBody:\n%s", res$status_code, url, txt))
   }
-  
-  stop("kaggle CLI not found on this server.")
+  txt
+}
+
+kaggle_api_download <- function(path, destfile) {
+  h <- kaggle_auth_handle()
+  url <- paste0("https://www.kaggle.com/api/v1", path)
+  curl::curl_download(url, destfile = destfile, handle = h, quiet = TRUE, mode = "wb")
+  destfile
 }
 
 
@@ -205,78 +184,35 @@ extract_kaggle_ref <- function(dataset_id, url) {
 }
 
 kaggle_list_files <- function(ref) {
+  parts <- strsplit(ref, "/", fixed = TRUE)[[1]]
+  if (length(parts) != 2) stop("Invalid Kaggle ref (expected owner/dataset): ", ref)
   
-  # 确保子进程也能拿到 UA
-  UA <- "shiny-connect"
-  extra_env <- c(
-    paste0("HTTP_USER_AGENT=", UA),
-    paste0("KAGGLE_USER_AGENT=", UA),
-    paste0("KAGGLE_HTTP_USER_AGENT=", UA)
-  )
+  owner <- curl::curl_escape(parts[1])
+  ds    <- curl::curl_escape(parts[2])
   
-  py_code <- "
-import os, sys, csv
-# patch requests: if User-Agent is None, force a string
-try:
-    import requests
-    from requests.sessions import Session
-    _old = Session.request
-    def _patched(self, method, url, **kwargs):
-        headers = kwargs.get('headers') or {}
-        if headers.get('User-Agent') is None:
-            headers['User-Agent'] = os.environ.get('HTTP_USER_AGENT') or 'shiny-connect'
-            kwargs['headers'] = headers
-        return _old(self, method, url, **kwargs)
-    Session.request = _patched
-except Exception:
-    pass
-
-from kaggle.api.kaggle_api_extended import KaggleApi
-
-ref = sys.argv[1]
-api = KaggleApi()
-api.authenticate()
-
-obj = api.dataset_list_files(ref)
-files = getattr(obj, 'files', []) or []
-
-w = csv.writer(sys.stdout)
-w.writerow(['name','size'])
-for f in files:
-    name = getattr(f, 'name', '')
-    size = getattr(f, 'totalBytes', None)
-    if size is None:
-        size = getattr(f, 'size', None)
-    if size is None:
-        size = ''
-    w.writerow([name, size])
-"
+  # GET /datasets/list/:ownerSlug/:datasetSlug
+  txt <- kaggle_api_get(sprintf("/datasets/list/%s/%s", owner, ds))
   
-  out <- tryCatch(
-    run_kaggle_py(py_code, args = c(ref), extra_env = extra_env),
-    error = function(e) {
-      warning("Failed to list files from Kaggle via Python API:\n", conditionMessage(e))
-      return(character())
-    }
-  )
+  obj <- jsonlite::fromJSON(txt, flatten = TRUE)
   
-  if (length(out) == 0) {
-    return(data.frame(name = character(), size = character(), stringsAsFactors = FALSE))
-  }
+  # 兼容不同返回结构：可能直接是 data.frame，也可能包在 list 里
+  df <- if (is.data.frame(obj)) obj else if (is.list(obj) && length(obj) > 0 && is.data.frame(obj[[1]])) obj[[1]] else as.data.frame(obj)
   
-  df <- readr::read_csv(I(paste(out, collapse = "\n")), show_col_types = FALSE)
   names(df) <- tolower(names(df))
   
-  if (!("name" %in% names(df))) {
-    warning("Python API output missing 'name'.\nOutput:\n", paste(out, collapse = "\n"))
-    return(data.frame(name = character(), size = character(), stringsAsFactors = FALSE))
+  # 尽量找出文件名列
+  name_col <- intersect(c("name", "filename", "file", "ref"), names(df))[1]
+  if (is.na(name_col)) {
+    stop("Kaggle API response missing file name column.\nBody:\n", txt)
   }
   
+  df$name <- as.character(df[[name_col]])
+  
   df %>%
-    mutate(name = as.character(.data$name)) %>%
-    filter(str_detect(tolower(name), "\\.(csv|tsv)$")) %>%
-    arrange(name)
+    dplyr::filter(stringr::str_detect(tolower(.data$name), "\\.(csv|tsv)$")) %>%
+    dplyr::arrange(.data$name)
 }
+
 
 
 
@@ -291,72 +227,38 @@ kaggle_download_to_temp <- function(ref, file_in_dataset, cache_dir) {
   target_path <- file.path(out_dir, basename(file_in_dataset))
   if (file.exists(target_path)) return(target_path)
   
-  UA <- "shiny-connect"
-  extra_env <- c(
-    paste0("HTTP_USER_AGENT=", UA),
-    paste0("KAGGLE_USER_AGENT=", UA),
-    paste0("KAGGLE_HTTP_USER_AGENT=", UA)
-  )
+  parts <- strsplit(ref, "/", fixed = TRUE)[[1]]
+  owner <- curl::curl_escape(parts[1])
+  ds    <- curl::curl_escape(parts[2])
+  fn    <- curl::curl_escape(file_in_dataset)
   
-  py_code <- "
-import os, sys, zipfile, glob
-from kaggle.api.kaggle_api_extended import KaggleApi
-
-# patch requests
-try:
-    import requests
-    from requests.sessions import Session
-    _old = Session.request
-    def _patched(self, method, url, **kwargs):
-        headers = kwargs.get('headers') or {}
-        if headers.get('User-Agent') is None:
-            headers['User-Agent'] = os.environ.get('HTTP_USER_AGENT') or 'shiny-connect'
-            kwargs['headers'] = headers
-        return _old(self, method, url, **kwargs)
-    Session.request = _patched
-except Exception:
-    pass
-
-ref  = sys.argv[1]
-fn   = sys.argv[2]
-outd = sys.argv[3]
-
-os.makedirs(outd, exist_ok=True)
-
-api = KaggleApi()
-api.authenticate()
-
-api.dataset_download_file(ref, fn, path=outd, force=True, quiet=True)
-
-# unzip any zip files in outd
-for z in glob.glob(os.path.join(outd, '*.zip')):
-    with zipfile.ZipFile(z, 'r') as zip_ref:
-        zip_ref.extractall(outd)
-    try:
-        os.remove(z)
-    except Exception:
-        pass
-
-print('OK')
-"
+  tmp_zip <- file.path(out_dir, "download.tmp")
   
-  # 运行 python 下载
-  tryCatch(
-    run_kaggle_py(py_code, args = c(ref, file_in_dataset, out_dir), extra_env = extra_env),
-    error = function(e) stop("Kaggle download via Python API failed:\n", conditionMessage(e))
-  )
+  # GET /datasets/download/:ownerSlug/:datasetSlug/:fileName
+  kaggle_api_download(sprintf("/datasets/download/%s/%s/%s", owner, ds, fn), tmp_zip)
   
+  # 判断是不是 zip（zip 文件头 "PK"）
+  sig <- readBin(tmp_zip, what = "raw", n = 2)
+  is_zip <- length(sig) == 2 && identical(sig, as.raw(c(0x50, 0x4B)))
   
-  if (!file.exists(target_path)) {
-    stop(paste0(
-      "Kaggle download failed.\n",
-      "Args: ", paste(args, collapse = " "),
-      "\n\nOutput:\n", paste(status, collapse = "\n")
-    ))
+  if (is_zip) {
+    utils::unzip(tmp_zip, exdir = out_dir)
+    unlink(tmp_zip)
+    
+    cand <- list.files(out_dir, recursive = TRUE, full.names = TRUE)
+    hit <- cand[basename(cand) == basename(file_in_dataset)]
+    if (length(hit) == 0) {
+      stop("Downloaded zip but cannot find file inside: ", file_in_dataset)
+    }
+    file.copy(hit[1], target_path, overwrite = TRUE)
+    return(target_path)
+  } else {
+    # 不是 zip，就当作文件本体
+    file.rename(tmp_zip, target_path)
+    return(target_path)
   }
-  
-  target_path
 }
+
 
 
 shinyServer(function(input, output, session) {
@@ -370,16 +272,16 @@ shinyServer(function(input, output, session) {
   }, ignoreInit = TRUE)
   
   meta <- eventReactive(input$load_meta, {
-    validate(need(file.exists(input$meta_path), "Metadata CSV not found."))
+    shiny::validate(shiny::need(file.exists(input$meta_path), "Metadata CSV not found."))
     readr::read_csv(input$meta_path, show_col_types = FALSE)
   }, ignoreInit = FALSE)
   
   meta_filtered <- reactive({
     df <- meta()
-    validate(
-      need(COL_TABULAR %in% names(df), paste0("Missing column: ", COL_TABULAR)),
-      need(COL_URL %in% names(df), paste0("Missing column: ", COL_URL)),
-      need(COL_ID %in% names(df), paste0("Missing column: ", COL_ID))
+    shiny::validate(
+      shiny::need(COL_TABULAR %in% names(df), paste0("Missing column: ", COL_TABULAR)),
+      shiny::need(COL_URL %in% names(df), paste0("Missing column: ", COL_URL)),
+      shiny::need(COL_ID %in% names(df), paste0("Missing column: ", COL_ID))
     )
     
     df %>%
@@ -393,7 +295,7 @@ shinyServer(function(input, output, session) {
   
   output$dataset_ui <- renderUI({
     df <- meta_filtered()
-    validate(need(nrow(df) > 0, "No rows after filtering tabular_files == 1."))
+    shiny::validate(shiny::need(nrow(df) > 0, "No rows after filtering tabular_files == 1."))
     
     title_vec <- df[[COL_TITLE]]
     idx <- is.na(title_vec) | title_vec == ""
@@ -414,7 +316,7 @@ shinyServer(function(input, output, session) {
   
   output$file_ui <- renderUI({
     fd <- files_df()
-    validate(need(nrow(fd) > 0, "No CSV/TSV files found in this dataset (or listing failed)."))
+    shiny::validate(shiny::need(nrow(fd) > 0, "No CSV/TSV files found in this dataset (or listing failed)."))
     selectInput("file_pick", "Select file inside dataset (-f)", choices = fd$name)
   })
   
