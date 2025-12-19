@@ -49,14 +49,14 @@ has_kaggle_creds <- function() {
 }
 
 ensure_kaggle_auth <- function() {
-  # 1) 强制 User-Agent，避免 Connect 上变成 None
+  # 1) 强制 User-Agent（给 R / curl / kaggle cli 都留一份）
   Sys.setenv(
     KAGGLE_HTTP_USER_AGENT = "shiny-connect",
     KAGGLE_USER_AGENT      = "shiny-connect",
     HTTP_USER_AGENT        = "shiny-connect"
   )
   
-  # 2) 把 secret variables 写成 kaggle.json（Connect 上 ~ 目录不一定可用/持久）
+  # 2) 把 secret variables 写成 kaggle.json（并加上 user_agent）
   user <- Sys.getenv("KAGGLE_USERNAME")
   key  <- Sys.getenv("KAGGLE_KEY")
   
@@ -64,13 +64,19 @@ ensure_kaggle_auth <- function() {
     cfg <- file.path(tempdir(), "kaggle_cfg")
     dir.create(cfg, showWarnings = FALSE, recursive = TRUE)
     
-    json <- sprintf('{"username":"%s","key":"%s"}', user, key)
-    writeLines(json, file.path(cfg, "kaggle.json"))
-    Sys.chmod(file.path(cfg, "kaggle.json"), "600")
+    cfg_json <- jsonlite::toJSON(
+      list(username = user, key = key, user_agent = "shiny-connect"),
+      auto_unbox = TRUE
+    )
+    cfg_path <- file.path(cfg, "kaggle.json")
+    writeLines(cfg_json, cfg_path)
+    Sys.chmod(cfg_path, "600")
     
+    # 关键：让 kaggle CLI / kaggle python 都从这里读配置
     Sys.setenv(KAGGLE_CONFIG_DIR = cfg)
   }
 }
+
 
 run_kaggle_py <- function(py_code, args = character(), extra_env = character()) {
   if (!nzchar(PY_BIN)) stop("python not found on this server.")
@@ -324,6 +330,7 @@ kaggle_download_to_temp <- function(ref, file_in_dataset, cache_dir) {
 
 
 
+ensure_kaggle_auth()
 
 shinyServer(function(input, output, session) {
   
@@ -553,6 +560,8 @@ shinyServer(function(input, output, session) {
       kaggle_key_set  = nzchar(Sys.getenv("KAGGLE_KEY")),
       kaggle_user_agent = Sys.getenv("KAGGLE_USER_AGENT"),
       http_user_agent   = Sys.getenv("HTTP_USER_AGENT"),
+      kaggle_config_dir = Sys.getenv("KAGGLE_CONFIG_DIR"),
+      kaggle_json_exists = file.exists(file.path(Sys.getenv("KAGGLE_CONFIG_DIR"), "kaggle.json")),
       meta_path = input$meta_path,
       cache_dir = cache_dir(),
       picked_ref = input$ref_pick,
