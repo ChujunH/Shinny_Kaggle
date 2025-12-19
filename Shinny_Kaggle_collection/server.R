@@ -52,21 +52,40 @@ ensure_kaggle_auth <- function() {
 
 
 run_kaggle <- function(args) {
-  ensure_kaggle_auth()
+  
+  # 写 kaggle.json 到临时目录 + 配好 config dir
+  user <- Sys.getenv("KAGGLE_USERNAME")
+  key  <- Sys.getenv("KAGGLE_KEY")
+  if (nzchar(user) && nzchar(key)) {
+    cfg <- file.path(tempdir(), "kaggle_cfg")
+    dir.create(cfg, showWarnings = FALSE, recursive = TRUE)
+    writeLines(sprintf('{"username":"%s","key":"%s"}', user, key),
+               file.path(cfg, "kaggle.json"))
+    Sys.chmod(file.path(cfg, "kaggle.json"), "600")
+    Sys.setenv(KAGGLE_CONFIG_DIR = cfg)
+  }
   
   if (!has_kaggle_creds()) {
     stop("Kaggle credentials not found. Set KAGGLE_USERNAME and KAGGLE_KEY on Connect Cloud (secret variables).")
   }
   
+  # 显式传给 kaggle 子进程，避免 User-Agent 变 None
+  UA <- "shiny-connect"
+  extra_env <- c(
+    paste0("KAGGLE_USER_AGENT=", UA),
+    paste0("HTTP_USER_AGENT=", UA),
+    paste0("KAGGLE_HTTP_USER_AGENT=", UA)
+  )
+  
   if (nzchar(KAGGLE_BIN)) {
-    out <- system2(KAGGLE_BIN, args, stdout = TRUE, stderr = TRUE)
+    out <- system2(KAGGLE_BIN, args, stdout = TRUE, stderr = TRUE, env = extra_env)
     status <- attr(out, "status") %||% 0
     if (status != 0) stop("Kaggle CLI failed.\n", paste(out, collapse = "\n"))
     return(out)
   }
   
   if (nzchar(PY_BIN)) {
-    out <- system2(PY_BIN, c("-m", "kaggle", args), stdout = TRUE, stderr = TRUE)
+    out <- system2(PY_BIN, c("-m", "kaggle", args), stdout = TRUE, stderr = TRUE, env = extra_env)
     status <- attr(out, "status") %||% 0
     if (status != 0) stop("python -m kaggle failed.\n", paste(out, collapse = "\n"))
     return(out)
@@ -74,6 +93,7 @@ run_kaggle <- function(args) {
   
   stop("Neither kaggle CLI nor python found.")
 }
+
 
 
 # Helper: default fallback for NULL/NA/""
@@ -399,6 +419,8 @@ shinyServer(function(input, output, session) {
       python_bin = PY_BIN,
       kaggle_user_set = nzchar(Sys.getenv("KAGGLE_USERNAME")),
       kaggle_key_set  = nzchar(Sys.getenv("KAGGLE_KEY")),
+      kaggle_user_agent = Sys.getenv("KAGGLE_USER_AGENT"),
+      http_user_agent   = Sys.getenv("HTTP_USER_AGENT"),
       meta_path = input$meta_path,
       cache_dir = cache_dir(),
       picked_ref = input$ref_pick,
