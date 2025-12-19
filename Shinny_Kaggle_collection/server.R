@@ -66,49 +66,35 @@ extract_kaggle_ref <- function(dataset_id, url) {
 }
 
 kaggle_list_files <- function(ref) {
-  if (!file.exists(KAGGLE_BIN)) {
-    stop(paste0("Kaggle CLI not found at: ", KAGGLE_BIN,
-                "\nPlease update KAGGLE_BIN in server.R to your `which kaggle` path."))
-  }
   
   out <- tryCatch(
-    system2(KAGGLE_BIN, c("datasets", "files", "-d", ref), stdout = TRUE, stderr = TRUE),
+    run_kaggle(c("datasets", "files", "--csv", ref)),
     error = function(e) {
-      stop(paste0("Failed to run Kaggle CLI from R.\n", conditionMessage(e)))
+      stop(paste0("Failed to list files from Kaggle.\n", conditionMessage(e)))
     }
   )
   
-  # Find header line
   lines <- out[str_detect(out, "\\S")]
-  hdr_i <- which(str_detect(lines, "^name\\s+size\\s+creationDate"))
-  if (length(hdr_i) == 0) {
-    stop(paste("Failed to parse file list.\nOutput:\n", paste(out, collapse = "\n")))
+  txt <- paste(lines, collapse = "\n")
+  
+  df <- tryCatch(
+    readr::read_csv(I(txt), show_col_types = FALSE),
+    error = function(e) {
+      stop(paste0("Failed to parse Kaggle --csv output.\n\nOutput:\n", paste(out, collapse = "\n")))
+    }
+  )
+  
+  names(df) <- tolower(names(df))
+  if (!("name" %in% names(df))) {
+    stop(paste0("Kaggle --csv output missing 'name' column.\n\nOutput:\n", paste(out, collapse = "\n")))
   }
   
-  # Parse rows after header + separator
-  data_lines <- lines[(hdr_i + 2):length(lines)]
-  data_lines <- data_lines[!str_detect(data_lines, "^[-]+$")]
-  data_lines <- data_lines[str_detect(data_lines, "\\S")]
-  
-  parsed <- lapply(data_lines, function(x) {
-    parts <- str_split(x, "\\s{2,}", simplify = TRUE)
-    parts <- parts[parts != ""]
-    if (length(parts) < 3) return(NULL)
-    data.frame(
-      name = parts[1],
-      size = parts[2],
-      creationDate = parts[3],
-      stringsAsFactors = FALSE
-    )
-  })
-  
-  df <- bind_rows(parsed)
-  
-  # Only tabular files
   df %>%
+    mutate(name = as.character(.data$name)) %>%
     filter(str_detect(tolower(name), "\\.(csv|tsv)$")) %>%
     arrange(name)
 }
+
 
 kaggle_download_to_temp <- function(ref, file_in_dataset, cache_dir) {
   dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
@@ -122,7 +108,7 @@ kaggle_download_to_temp <- function(ref, file_in_dataset, cache_dir) {
   
   args <- c("datasets", "download", "-d", ref, "-f", file_in_dataset, "--path", out_dir, "--unzip")
   status <- tryCatch(
-    system2(KAGGLE_BIN, args, stdout = TRUE, stderr = TRUE),
+    run_kaggle(args),
     error = function(e) {
       stop(paste0("Kaggle download failed.\n", conditionMessage(e)))
     }
@@ -130,13 +116,15 @@ kaggle_download_to_temp <- function(ref, file_in_dataset, cache_dir) {
   
   if (!file.exists(target_path)) {
     stop(paste0(
-      "Kaggle download failed.\nCommand: ", KAGGLE_BIN, " ", paste(args, collapse = " "),
+      "Kaggle download failed.\n",
+      "Args: ", paste(args, collapse = " "),
       "\n\nOutput:\n", paste(status, collapse = "\n")
     ))
   }
   
   target_path
 }
+
 
 shinyServer(function(input, output, session) {
   
@@ -361,6 +349,9 @@ shinyServer(function(input, output, session) {
   output$debug_out <- renderPrint({
     list(
       kaggle_bin = KAGGLE_BIN,
+      python_bin = PY_BIN,
+      kaggle_user_set = nzchar(Sys.getenv("KAGGLE_USERNAME")),
+      kaggle_key_set  = nzchar(Sys.getenv("KAGGLE_KEY")),
       meta_path = input$meta_path,
       cache_dir = cache_dir(),
       picked_ref = input$ref_pick,
