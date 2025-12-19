@@ -5,8 +5,6 @@ library(stringr)
 library(DT)
 library(ggplot2)
 library(tools)
-library(jsonlite)
-library(curl)
 
 
 if (file.exists("/opt/anaconda3/bin/kaggle")) {
@@ -18,6 +16,13 @@ if (file.exists("/opt/anaconda3/bin/kaggle")) {
 # ====== Kaggle runner (local + cloud compatible) ======
 # local: use CLI if available; cloud: fallback to python -m kaggle
 KAGGLE_BIN <- Sys.getenv("KAGGLE_BIN", unset = Sys.which("kaggle"))
+
+# Helper: default fallback for NULL/NA/""
+`%||%` <- function(a, b) {
+  if (is.null(a) || length(a) == 0) return(b)
+  if (length(a) == 1 && (is.na(a) || a == "")) return(b)
+  a
+}
 
 # Prefer python that lives next to kaggle binary (same env)
 PY_BIN <- Sys.getenv("PY_BIN", unset = "")
@@ -76,6 +81,8 @@ ensure_kaggle_auth <- function() {
     Sys.setenv(KAGGLE_CONFIG_DIR = cfg)
   }
 }
+
+ensure_kaggle_auth()
 
 
 run_kaggle_py <- function(py_code, args = character(), extra_env = character()) {
@@ -159,12 +166,7 @@ kaggle_api_download <- function(path, destfile) {
 
 
 
-# Helper: default fallback for NULL/NA/""
-`%||%` <- function(a, b) {
-  if (is.null(a) || length(a) == 0) return(b)
-  if (length(a) == 1 && (is.na(a) || a == "")) return(b)
-  a
-}
+
 
 
 # Columns in your metadata CSV (you provided names(A))
@@ -207,71 +209,151 @@ run_kaggle_cli <- function(args) {
 
 # ---------- CLI version: list files ----------
 kaggle_list_files_cli <- function(ref) {
-  out <- run_kaggle_cli(c("datasets", "files", "--csv", ref))
+  if (!nzchar(KAGGLE_BIN)) stop("kaggle CLI not found (KAGGLE_BIN empty).")
   
-  lines <- out[str_detect(out, "\\S")]
-  txt <- paste(lines, collapse = "\n")
-  
-  df <- tryCatch(
-    readr::read_csv(I(txt), show_col_types = FALSE),
-    error = function(e) {
-      stop("Failed to parse Kaggle CLI --csv output.\n\nOutput:\n", paste(out, collapse = "\n"))
-    }
+  # 给子进程硬塞 UA（本地一般不需要，但无害）
+  extra_env <- c(
+    "HTTP_USER_AGENT=shiny-connect",
+    "KAGGLE_USER_AGENT=shiny-connect",
+    "KAGGLE_HTTP_USER_AGENT=shiny-connect"
   )
   
-  names(df) <- tolower(names(df))
-  if (!("name" %in% names(df))) {
-    stop("Kaggle CLI output missing 'name' column.\n\nOutput:\n", paste(out, collapse = "\n"))
-  }
+  out <- system2(KAGGLE_BIN, c("datasets", "files", "--csv", ref),
+                 stdout = TRUE, stderr = TRUE, env = extra_env)
+  status <- attr(out, "status") %||% 0
+  if (status != 0) stop(paste(out, collapse = "\n"))
   
-  df %>%
-    mutate(name = as.character(.data$name)) %>%
-    filter(str_detect(tolower(name), "\\.(csv|tsv)$")) %>%
-    arrange(name)
+  # Kaggle CLI 有时会夹杂 warning，找到真正的 csv header 行
+  i <- which(grepl("^name,", out))[1]
+  if (is.na(i)) stop("Kaggle --csv output missing 'name' column.\n", paste(out, collapse="\n"))
+  
+  txt <- paste(out[i:length(out)], collapse = "\n")
+  df <- readr::read_csv(txt, show_col_types = FALSE)
+  names(df) <- tolower(names(df))
+  df
+}
+
+kaggle_list_files_py <- function(ref) {
+  py_code <- "
+import os, sys, json
+from kaggle.api.kaggle_api_extended import KaggleApi
+
+ua = os.environ.get('KAGGLE_USER_AGENT') or os.environ.get('HTTP_USER_AGENT') or 'shiny-connect'
+
+api = KaggleApi()
+api.authenticate()
+
+# 关键：强制 user_agent 是字符串，避免 None
+try:
+    api.api_client.configuration.user_agent = ua
+except Exception:
+    pass
+
+files = api.dataset_list_files(sys.argv[1]).files
+out = []
+for f in files:
+    out.append({
+        'name': getattr(f, 'name', ''),
+        'size': getattr(f, 'size', None)
+    })
+print(json.dumps(out))
+"
+  extra_env <- c(
+    "HTTP_USER_AGENT=shiny-connect",
+    "KAGGLE_USER_AGENT=shiny-connect",
+    "KAGGLE_HTTP_USER_AGENT=shiny-connect"
+  )
+  out <- run_kaggle_py(py_code, args = c(ref), extra_env = extra_env)
+  df <- jsonlite::fromJSON(paste(out, collapse = ""), simplifyDataFrame = TRUE)
+  if (is.null(df) || nrow(df) == 0) df <- data.frame(name=character(), size=double())
+  df
+}
+kaggle_download_file_py <- function(ref, filename, out_dir) {
+  py_code <- "
+import os, sys, json, zipfile, glob
+from kaggle.api.kaggle_api_extended import KaggleApi
+
+ua = os.environ.get('KAGGLE_USER_AGENT') or os.environ.get('HTTP_USER_AGENT') or 'shiny-connect'
+
+ref = sys.argv[1]
+fn  = sys.argv[2]
+out = sys.argv[3]
+os.makedirs(out, exist_ok=True)
+
+api = KaggleApi()
+api.authenticate()
+try:
+    api.api_client.configuration.user_agent = ua
+except Exception:
+    pass
+
+api.dataset_download_file(ref, fn, path=out, force=True, quiet=True)
+
+base = os.path.basename(fn)
+cand1 = os.path.join(out, base)
+cand2 = os.path.join(out, base + '.zip')
+
+# 有时会下载成 zip
+if os.path.exists(cand2) and zipfile.is_zipfile(cand2):
+    with zipfile.ZipFile(cand2, 'r') as z:
+        z.extractall(out)
+    os.remove(cand2)
+
+# 如果目标文件不在，兜底找同名
+if not os.path.exists(cand1):
+    hits = glob.glob(os.path.join(out, '**', base), recursive=True)
+    if hits:
+        cand1 = hits[0]
+
+print(json.dumps({'path': cand1}))
+"
+  extra_env <- c(
+    "HTTP_USER_AGENT=shiny-connect",
+    "KAGGLE_USER_AGENT=shiny-connect",
+    "KAGGLE_HTTP_USER_AGENT=shiny-connect"
+  )
+  out <- run_kaggle_py(py_code, args = c(ref, filename, out_dir), extra_env = extra_env)
+  obj <- jsonlite::fromJSON(paste(out, collapse = ""))
+  obj$path
+}
+kaggle_download_file_cli <- function(ref, filename, out_dir) {
+  if (!nzchar(KAGGLE_BIN)) stop("kaggle CLI not found (KAGGLE_BIN empty).")
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  out <- system2(KAGGLE_BIN,
+                 c("datasets", "download", "-d", ref, "-f", filename, "-p", out_dir, "--force"),
+                 stdout = TRUE, stderr = TRUE)
+  status <- attr(out, "status") %||% 0
+  if (status != 0) stop(paste(out, collapse = "\n"))
+  
+  # CLI 往往下载成 filename.zip，再解压
+  z <- file.path(out_dir, paste0(basename(filename), ".zip"))
+  if (file.exists(z)) {
+    utils::unzip(z, exdir = out_dir)
+    unlink(z)
+  }
+  file.path(out_dir, basename(filename))
 }
 
 
 kaggle_list_files <- function(ref) {
-  h <- kaggle_auth_handle()
-  if (is.null(h)) {
-    # 没 key：走你原来的 CLI 版本（本地）
-    return(kaggle_list_files_cli(ref))   # 你把旧版函数改名留着
+  ensure_kaggle_auth()
+  
+  # Connect Cloud：有 kaggle python 包（log 里就是 kaggle==1.8.2）
+  if (has_python_kaggle()) {
+    df <- kaggle_list_files_py(ref)
+  } else {
+    df <- kaggle_list_files_cli(ref)
   }
-  # 有 key：走 API 版本（Connect）
-  parts <- strsplit(ref, "/", fixed = TRUE)[[1]]
-  if (length(parts) != 2) stop("Invalid Kaggle ref (expected owner/dataset): ", ref)
-  
-  owner <- curl::curl_escape(parts[1])
-  ds    <- curl::curl_escape(parts[2])
-  
-  # GET /datasets/list/:ownerSlug/:datasetSlug
-  txt <- kaggle_api_get(sprintf("/datasets/list/%s/%s", owner, ds))
-  
-  obj <- jsonlite::fromJSON(txt, flatten = TRUE)
-  
-  # 兼容不同返回结构：可能直接是 data.frame，也可能包在 list 里
-  df <- if (is.data.frame(obj)) obj else if (is.list(obj) && length(obj) > 0 && is.data.frame(obj[[1]])) obj[[1]] else as.data.frame(obj)
-  
-  names(df) <- tolower(names(df))
-  
-  # 尽量找出文件名列
-  name_col <- intersect(c("name", "filename", "file", "ref"), names(df))[1]
-  if (is.na(name_col)) {
-    stop("Kaggle API response missing file name column.\nBody:\n", txt)
-  }
-  
-  df$name <- as.character(df[[name_col]])
   
   df %>%
+    dplyr::mutate(name = as.character(.data$name)) %>%
     dplyr::filter(stringr::str_detect(tolower(.data$name), "\\.(csv|tsv)$")) %>%
     dplyr::arrange(.data$name)
 }
 
-
-
-
-
 kaggle_download_to_temp <- function(ref, file_in_dataset, cache_dir) {
+  ensure_kaggle_auth()
   dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
   
   safe_ref <- gsub("[^A-Za-z0-9._-]+", "_", ref)
@@ -281,52 +363,23 @@ kaggle_download_to_temp <- function(ref, file_in_dataset, cache_dir) {
   target_path <- file.path(out_dir, basename(file_in_dataset))
   if (file.exists(target_path)) return(target_path)
   
-  h <- kaggle_auth_handle()
-  
-  if (is.null(h)) {
-    # ---- local fallback: use CLI download ----
-    ensure_kaggle_auth()
-    args <- c("datasets", "download", "-d", ref, "-f", file_in_dataset, "--path", out_dir, "--unzip")
-    out <- system2(KAGGLE_BIN, args, stdout = TRUE, stderr = TRUE)
-    status <- attr(out, "status") %||% 0
-    if (status != 0) {
-      stop("Kaggle CLI download failed.\nArgs: ", paste(args, collapse = " "),
-           "\n\nOutput:\n", paste(out, collapse = "\n"))
-    }
-    
-    # file should appear after unzip
-    cand <- list.files(out_dir, recursive = TRUE, full.names = TRUE)
-    hit <- cand[basename(cand) == basename(file_in_dataset)]
-    if (length(hit) == 0) stop("Downloaded but cannot find file: ", file_in_dataset)
-    file.copy(hit[1], target_path, overwrite = TRUE)
-    return(target_path)
-  }
-  
-  # ---- Connect (or local with keys): use API download ----
-  parts <- strsplit(ref, "/", fixed = TRUE)[[1]]
-  owner <- curl::curl_escape(parts[1])
-  ds    <- curl::curl_escape(parts[2])
-  fn    <- curl::curl_escape(file_in_dataset)
-  
-  tmp_bin <- file.path(out_dir, "download.tmp")
-  kaggle_api_download(sprintf("/datasets/download/%s/%s/%s", owner, ds, fn), tmp_bin)
-  
-  sig <- readBin(tmp_bin, what = "raw", n = 2)
-  is_zip <- length(sig) == 2 && identical(sig, as.raw(c(0x50, 0x4B)))
-  
-  if (is_zip) {
-    utils::unzip(tmp_bin, exdir = out_dir)
-    unlink(tmp_bin)
-    cand <- list.files(out_dir, recursive = TRUE, full.names = TRUE)
-    hit <- cand[basename(cand) == basename(file_in_dataset)]
-    if (length(hit) == 0) stop("Downloaded zip but cannot find file inside: ", file_in_dataset)
-    file.copy(hit[1], target_path, overwrite = TRUE)
-    return(target_path)
+  if (has_python_kaggle()) {
+    p <- kaggle_download_file_py(ref, file_in_dataset, out_dir)
   } else {
-    file.rename(tmp_bin, target_path)
-    return(target_path)
+    p <- kaggle_download_file_cli(ref, file_in_dataset, out_dir)
   }
+  
+  if (!file.exists(p)) stop("Downloaded but file not found: ", p)
+  p
 }
+
+
+
+
+
+
+
+
 
 
 
