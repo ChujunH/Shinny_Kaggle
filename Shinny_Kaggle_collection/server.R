@@ -26,23 +26,63 @@ has_kaggle_creds <- function() {
   (nzchar(user) && nzchar(key)) || file.exists(json)
 }
 
+ensure_kaggle_auth <- function() {
+  # 1) 强制 User-Agent，避免 Connect 上变成 None
+  Sys.setenv(
+    KAGGLE_HTTP_USER_AGENT = "shiny-connect",
+    KAGGLE_USER_AGENT      = "shiny-connect",
+    HTTP_USER_AGENT        = "shiny-connect"
+  )
+  
+  # 2) 把 secret variables 写成 kaggle.json（Connect 上 ~ 目录不一定可用/持久）
+  user <- Sys.getenv("KAGGLE_USERNAME")
+  key  <- Sys.getenv("KAGGLE_KEY")
+  
+  if (nzchar(user) && nzchar(key)) {
+    cfg <- file.path(tempdir(), "kaggle_cfg")
+    dir.create(cfg, showWarnings = FALSE, recursive = TRUE)
+    
+    json <- sprintf('{"username":"%s","key":"%s"}', user, key)
+    writeLines(json, file.path(cfg, "kaggle.json"))
+    Sys.chmod(file.path(cfg, "kaggle.json"), "600")
+    
+    Sys.setenv(KAGGLE_CONFIG_DIR = cfg)
+  }
+}
+
+
 run_kaggle <- function(args) {
+  ensure_kaggle_auth()
+  
   if (!has_kaggle_creds()) {
     stop("Kaggle credentials not found. Set KAGGLE_USERNAME and KAGGLE_KEY on Connect Cloud (secret variables).")
   }
+  
   if (nzchar(KAGGLE_BIN)) {
-    return(system2(KAGGLE_BIN, args, stdout = TRUE, stderr = TRUE))
+    out <- system2(KAGGLE_BIN, args, stdout = TRUE, stderr = TRUE)
+    status <- attr(out, "status") %||% 0
+    if (status != 0) stop("Kaggle CLI failed.\n", paste(out, collapse = "\n"))
+    return(out)
   }
+  
   if (nzchar(PY_BIN)) {
-    return(system2(PY_BIN, c("-m", "kaggle", args), stdout = TRUE, stderr = TRUE))
+    out <- system2(PY_BIN, c("-m", "kaggle", args), stdout = TRUE, stderr = TRUE)
+    status <- attr(out, "status") %||% 0
+    if (status != 0) stop("python -m kaggle failed.\n", paste(out, collapse = "\n"))
+    return(out)
   }
+  
   stop("Neither kaggle CLI nor python found.")
 }
 
+
 # Helper: default fallback for NULL/NA/""
 `%||%` <- function(a, b) {
-  if (is.null(a) || length(a) == 0 || is.na(a) || a == "") b else a
+  if (is.null(a) || length(a) == 0) return(b)
+  if (length(a) == 1 && (is.na(a) || a == "")) return(b)
+  a
 }
+
 
 # Columns in your metadata CSV (you provided names(A))
 COL_TABULAR <- "tabular_files"
@@ -66,27 +106,33 @@ extract_kaggle_ref <- function(dataset_id, url) {
 }
 
 kaggle_list_files <- function(ref) {
-  
   out <- tryCatch(
     run_kaggle(c("datasets", "files", "--csv", ref)),
     error = function(e) {
-      stop(paste0("Failed to list files from Kaggle.\n", conditionMessage(e)))
+      warning("Failed to list files from Kaggle: ", conditionMessage(e))
+      return(character())
     }
   )
   
   lines <- out[str_detect(out, "\\S")]
+  if (length(lines) == 0) {
+    return(data.frame(name = character(), stringsAsFactors = FALSE))
+  }
+  
   txt <- paste(lines, collapse = "\n")
   
   df <- tryCatch(
     readr::read_csv(I(txt), show_col_types = FALSE),
     error = function(e) {
-      stop(paste0("Failed to parse Kaggle --csv output.\n\nOutput:\n", paste(out, collapse = "\n")))
+      warning("Failed to parse Kaggle --csv output.\nOutput:\n", paste(out, collapse = "\n"))
+      return(data.frame(name = character(), stringsAsFactors = FALSE))
     }
   )
   
   names(df) <- tolower(names(df))
   if (!("name" %in% names(df))) {
-    stop(paste0("Kaggle --csv output missing 'name' column.\n\nOutput:\n", paste(out, collapse = "\n")))
+    warning("Kaggle --csv output missing 'name' column.\nOutput:\n", paste(out, collapse = "\n"))
+    return(data.frame(name = character(), stringsAsFactors = FALSE))
   }
   
   df %>%
@@ -94,6 +140,7 @@ kaggle_list_files <- function(ref) {
     filter(str_detect(tolower(name), "\\.(csv|tsv)$")) %>%
     arrange(name)
 }
+
 
 
 kaggle_download_to_temp <- function(ref, file_in_dataset, cache_dir) {
